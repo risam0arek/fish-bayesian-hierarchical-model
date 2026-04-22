@@ -2,6 +2,11 @@
 
 A Quarto report implementing a Bayesian hierarchical Normal model on the [Fish Market dataset](https://www.kaggle.com/datasets/vipullrathod/fish-market) (Kaggle). The project was originally developed as a university assignment and is included here as a portfolio piece demonstrating applied Bayesian modelling.
 
+## Live report
+
+The interactive HTML report is available here:  
+👉 https://risam0arek.github.io/fish-bayesian-hierarchical-model/
+
 ## What the project covers
 
 - Exploratory data analysis across 7 fish species with unequal sample sizes
