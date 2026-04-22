@@ -1118,6 +1118,14 @@ Finally, we examine the marginal hyperparameter distributions by running
 JAGS with no data and no likelihood or group-level priors — sampling
 from the hyperpriors alone.
 
+> **Note on hyperparameter priors:** We do not back-transform hyperparameter
+> priors to the original scale. The priors are defined to be weakly informative
+> on the transformed scale, where they are well-behaved and interpretable in
+> terms of model regularisation. Back-transforming them would lead to extreme
+> and unstable values, especially for scale-related parameters, which are not
+> meaningful for prior interpretation. Therefore, all prior analysis and
+> specification is kept on the transformed scale.
+
 ```{r}
 jags_data_hyper <- list(A = 1)
 
