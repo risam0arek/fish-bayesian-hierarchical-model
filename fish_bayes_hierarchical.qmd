@@ -1,0 +1,1222 @@
+---
+title: "Bayesian Hierarchical Modelling of Fish Weights"
+date: last-modified
+author: Richard Marek
+lang: en
+format:
+  html:
+    html-math-method: katex
+    code-fold: true
+    code-summary: "Show code"
+    embed-resources: true
+    toc-title: Contents
+    toc: true
+    toc-depth: 3
+    toc-location: right
+    toc-expand: true
+    self-contained-math: true
+    fig-cap: true
+    number-sections: true
+    page-layout: article
+    theme: cosmo
+    max-width: 900px
+execute:
+  echo: true
+  warning: false
+  message: false
+  error: false
+  include: true
+  cache: true
+  fig-cap: true
+crossref:
+   tbl-title: "**Table**"
+   fig-title: "**Figure**"
+   tbl-labels: arabic
+   fig-labels: arabic
+   title-delim: "**.**"
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+```{r}
+#| echo: false
+library("tidyverse")
+library("runjags")
+library(ggplot2)
+library(HDInterval)
+library("bayestestR")
+library(TailRank)
+library(Biobase)
+library(invgamma)
+library(rjags)
+library(DT)
+library(knitr)
+library(kableExtra)
+library(scales)
+
+dataset <- read.csv(file = "Fish.csv", header = TRUE)
+```
+
+## Introduction
+
+Hierarchical Bayesian models are widely used in actuarial science,
+insurance, and catastrophe modelling, where data are naturally grouped —
+for example, losses by peril type, geographic region, or line of
+business. The central advantage of a hierarchical (multilevel) model is
+**partial pooling**: groups with sparse data borrow strength from the
+overall population, while groups with abundant data are primarily driven
+by their own observations. This adaptive shrinkage is especially
+valuable when group sample sizes are highly unequal, which is typical in
+practice.
+
+This project demonstrates these principles on the publicly available
+[Fish Market
+dataset](https://www.kaggle.com/datasets/vipullrathod/fish-market){target="_blank"},
+fitting a Bayesian hierarchical Normal model to fish weight data across
+seven species using JAGS (Just Another Gibbs Sampler). The methodology —
+semi-conjugate priors, Half-Cauchy hyperpriors, and MCMC simulation —
+transfers directly to grouped loss modelling contexts in (re)insurance.
+
+## Data Description
+
+The **Fish Market** dataset is freely available on
+[Kaggle](https://www.kaggle.com/datasets/vipullrathod/fish-market){target="_blank"}.
+It contains the following variables.
+
+-   **Numeric variables**:
+    -   `Height`, `Width`, `Length1`, `Length2`, `Length3` (dimensions
+        in centimetres — height, width, and length measured in three
+        different ways)
+    -   `Weight` (weight in grams)
+-   **Categorical variable**:
+    -   `Species` — classifies fish into 7 categories:
+        -   `Bream`
+        -   `Parkki`
+        -   `Perch`
+        -   `Pike`
+        -   `Roach`
+        -   `Smelt`
+        -   `Whitefish`
+
+> **Note on Parkki:** No reliable photographic source for a fish called
+> "Parkki" could be found. It is likely that this species name is
+> misspelled in the dataset — it may refer to *Abramis bjoerkna* (White
+> Bream / Silver Bream), known as "Pasuri" or "Blicca" in some European
+> languages.
+
+In this project we focus on comparing fish weight across species. The
+dataset contains 159 observations in total, one of which was removed due
+to a zero weight value.
+
+```{r}
+data <- dataset |>
+  select(Species, y = Weight) |>
+  filter(!is.na(y))
+
+data[data$y == 0, ]
+data <- data |> filter(y > 0)
+```
+
+## Exploratory Data Analysis
+
+We start by plotting a boxplot of the raw data. It is immediately
+apparent that individual species display substantially different weight
+distributions. Median weights range from single grams (`Smelt`) to
+approximately 600 g (`Bream`). Box widths — representing interquartile
+ranges — differ markedly, reflecting heterogeneous within-species
+variability. Sample sizes are also unbalanced: `Perch` has the most
+observations, while `Whitefish` has the fewest. For `Perch` there is a
+visible hint of two distinct sub-groups, possibly young versus adult
+fish or two sub-species. Several outliers are present in `Roach`.
+
+```{r}
+data |>
+  ggplot(aes(y = Species, x = y, fill = Species)) +
+  geom_boxplot(color = "black", alpha = 0.3, outlier.shape = NA) +
+  geom_jitter(pch = 21, size = 2, width = 0, height = 0.1) +
+  labs(x = "Weight (g)", y = "Species")
+```
+
+The summary table below confirms the large cross-species differences.
+Mean weight ranges from 11.2 g (`Smelt`) to 718.7 g (`Pike`), and sample
+variances differ by several orders of magnitude — `Smelt` has a standard
+deviation of 17.1 while `Pike` has a sample variance of 244,175.
+
+The most represented species is `Perch` (56 fish); the least represented
+is `Whitefish` (6 fish).
+
+```{r}
+ex_interactive <- data |>
+  group_by(Species) |>
+  summarise(
+    `Observations` = n(),
+    `Mean`         = mean(y),
+    `Sample Variance` = var(y),
+    .groups = "drop"
+  ) |>
+  mutate(
+    `Observations`    = number(`Observations`, big.mark = ",", accuracy = 1),
+    `Mean`            = number(`Mean`, big.mark = ",", accuracy = 0.1),
+    `Sample Variance` = number(`Sample Variance`, big.mark = ",", accuracy = 0.1)
+  )
+
+DT::datatable(
+  ex_interactive,
+  rownames = FALSE,
+  extensions = 'Buttons',
+  options = list(
+    dom = 'Bt',
+    buttons = c('copy', 'csv', 'excel'),
+    pageLength = 10
+  )
+) |>
+  DT::formatStyle(
+    columns = names(ex_interactive),
+    fontSize = '14px',
+    `text-align` = 'right'
+  )
+```
+
+We intend to work with a Normal likelihood model, so we first assess
+normality via the Shapiro–Wilk test.
+
+```{r}
+normality_tests_original <- data |>
+  group_by(Species) |>
+  summarise(
+    `Observations` = n(),
+    `p-value` = ifelse(shapiro.test(y)$p.value < 0.00001,
+                       "< 0.00001",
+                       format(round(shapiro.test(y)$p.value, 5), scientific = FALSE)),
+    "H\u2080: data are normally distributed" = ifelse(
+      shapiro.test(y)$p.value < 0.05,
+      "Rejected in favour of H\u2081",
+      "Not rejected"
+    )
+  ) |>
+  arrange(`p-value`)
+
+datatable(
+  normality_tests_original,
+  rownames = FALSE,
+  options = list(
+    dom = 'Bt',
+    pageLength = 7,
+    buttons = c('copy', 'csv', 'excel')
+  )
+) |>
+  formatStyle(
+    "H\u2080: data are normally distributed",
+    backgroundColor = styleEqual(
+      c("Rejected in favour of H\u2081", "Not rejected"),
+      c('#ffdddd', '#ddffdd')
+    )
+  )
+```
+
+At the 5% significance level we reject normality for `Perch`, `Pike`,
+`Smelt`, and `Roach`.
+
+Because four species fail the normality test, a transformation is
+needed. We apply a log transformation.
+
+```{r}
+data_jags <- data |>
+  mutate(
+    log_y  = log(y),
+    group  = as.numeric(as.factor(Species))
+  )
+```
+
+Shapiro–Wilk test on log-transformed data:
+
+```{r}
+normality_tests_log <- data_jags |>
+  group_by(Species) |>
+  summarise(
+    `Observations` = n(),
+    `p-value` = ifelse(shapiro.test(log_y)$p.value < 0.00001,
+                       "< 0.00001",
+                       format(round(shapiro.test(log_y)$p.value, 5), scientific = FALSE)),
+    "H\u2080: data are normally distributed" = ifelse(
+      shapiro.test(log_y)$p.value < 0.05,
+      "Rejected in favour of H\u2081",
+      "Not rejected"
+    )
+  ) |>
+  arrange(`p-value`)
+
+datatable(
+  normality_tests_log,
+  rownames = FALSE,
+  options = list(
+    dom = 'Bt',
+    pageLength = 7,
+    buttons = c('copy', 'csv', 'excel')
+  )
+) |>
+  formatStyle(
+    "H\u2080: data are normally distributed",
+    backgroundColor = styleEqual(
+      c("Rejected in favour of H\u2081", "Not rejected"),
+      c('#ffdddd', '#ddffdd')
+    )
+  )
+```
+
+After the log transformation, normality is rejected only for `Perch`,
+which we keep in mind during interpretation.
+
+However, during further development we found that the hierarchical model
+was numerically unstable under the plain log transformation
+
+$$Y_j = \ln(X_j), \quad j = 1, \dots, 7,$$
+
+where the index $j$ denotes the species. We therefore searched for a
+shifted log transformation of the form
+
+$$Y_j = \ln(X_j + c), \quad j = 1, \dots, 7,$$
+
+where $c > 0$ is a constant to be chosen carefully.
+
+Two competing requirements create a tension: a larger $c$ improves
+numerical stability, but also tends to compress the data and reduce
+p-values in the final inference, which can affect the interpretation of
+results.
+
+After several trials we settled on the compromise value $c = 50$, which
+provides sufficient stability while keeping the effect on statistical
+outputs acceptable. The final transformation is
+
+$$Y_j = \ln(X_j + 50), \quad j = 1, \dots, 7.$$
+
+```{r}
+c_shift <- 50
+
+data_jags <- data |>
+  mutate(
+    transf_y = log(y + c_shift),
+    group    = as.numeric(as.factor(Species))
+  )
+```
+
+Shapiro–Wilk test on the shifted log-transformed data:
+
+```{r}
+normality_tests_transf <- data_jags |>
+  group_by(Species) |>
+  summarise(
+    `Observations` = n(),
+    `p-value` = ifelse(shapiro.test(transf_y)$p.value < 0.00001,
+                       "< 0.00001",
+                       format(round(shapiro.test(transf_y)$p.value, 5), scientific = FALSE)),
+    "H\u2080: data are normally distributed" = ifelse(
+      shapiro.test(transf_y)$p.value < 0.05,
+      "Rejected in favour of H\u2081",
+      "Not rejected"
+    )
+  ) |>
+  arrange(`p-value`)
+
+datatable(
+  normality_tests_transf,
+  rownames = FALSE,
+  options = list(
+    dom = 'Bt',
+    pageLength = 7,
+    buttons = c('copy', 'csv', 'excel')
+  )
+) |>
+  formatStyle(
+    "H\u2080: data are normally distributed",
+    backgroundColor = styleEqual(
+      c("Rejected in favour of H\u2081", "Not rejected"),
+      c('#ffdddd', '#ddffdd')
+    )
+  )
+```
+
+At the 5% level, normality is still rejected for `Perch` and `Smelt`,
+which we keep in mind during interpretation.
+
+A boxplot of the transformed data confirms that even after
+transformation the species differ substantially. Medians fall roughly
+between 4 and 7 on the transformed scale, and box widths still vary
+considerably. Notable outliers remain — a very low value for `Perch`,
+and two extreme observations each for `Smelt` and `Roach`.
+
+```{r}
+data_jags |>
+  ggplot(aes(y = Species, x = transf_y, fill = Species)) +
+  geom_boxplot(color = "black", alpha = 0.3, outlier.shape = NA) +
+  geom_jitter(pch = 21, size = 2, width = 0, height = 0.1) +
+  labs(x = "Transformed weight", y = "Species")
+```
+
+Histograms of the transformed data suggest approximately Normal
+within-species distributions for most species. `Perch` still shows a
+bimodal hint. `Parkki` appears roughly uniform, and `Whitefish` has too
+few observations (6) to draw reliable conclusions.
+
+```{r}
+histogram <- data_jags |>
+  ggplot(aes(x = transf_y, fill = Species)) +
+  geom_histogram(bins = 30, color = "black", alpha = 0.7) +
+  facet_wrap(~Species, scales = "free") +
+  labs(x = "Transformed weight", y = "Count") +
+  theme_minimal() +
+  theme(legend.position = "none")
+print(histogram)
+```
+
+QQ-plots reveal light tails for `Perch`, heavy tails for `Roach` (more
+extreme values than a Normal would predict), a slight left tail for
+`Pike`, and two exceptionally high observations for `Smelt` relative to
+Normal quantiles.
+
+```{r}
+ggplot(data_jags, aes(sample = transf_y)) +
+  stat_qq() +
+  stat_qq_line(color = "red") +
+  facet_wrap(~Species, scales = "free") +
+  labs(x = "Theoretical quantiles", y = "Sample quantiles") +
+  theme_minimal()
+```
+
+```{r}
+mapping_table <- data_jags |> select(Species, group) |> distinct()
+```
+
+## Model
+
+We consider a hierarchical model for the transformed data
+$Y_{j} = \ln(X_{j} + 50)$, built on the standard Normal model with
+unknown mean and variance.
+
+For each species $j = 1, \dots, 7$ we observe i.i.d. Gaussian random
+variables
+$(Y_{j,1}, \dots, Y_{j,n_j}) \sim \text{i.i.d. } \mathcal{N}(\mu_j, \sigma_j^2)$.
+
+A sufficient statistic for $(\mu_j, \sigma_j^2)$ is
+
+$$
+\left( \sum_{i=1}^{n_j} Y_{j,i},\ \sum_{i=1}^{n_j} Y_{j,i}^2 \right),
+$$
+
+equivalently the sample mean and sample variance $(\bar{Y}_j, S^2_j)$.
+
+The joint density expressed in terms of the sufficient statistics is
+
+$$
+f(\bar{y}_j, s^2_j \mid \mu_j, \sigma_j^2) = (2\pi\sigma_j^2)^{-\frac{n_j}{2}} \exp\left[-\frac{(n_j-1)s_j^2}{2\sigma_j^2}\right] \exp\left[-\frac{n_j}{2\sigma_j^2}(\bar{y}_j - \mu_j)^2\right].
+$$
+
+The likelihood function is
+
+$$
+L(\mu_j, \sigma_j^2 \mid \bar{y}_j, s_j^2) = \exp \left[ - \frac{(n_j-1)s_j^2}{2\sigma_j^2}\right] \exp\left[-\frac{n_j}{2\sigma_j^2}(\bar{y}_j - \mu_j)^2\right].
+$$
+
+**Semi-conjugate prior distributions:**
+
+Variance (equivalently, precision): $$
+\sigma^2_j \sim \text{InvGamma}\left(\frac{b_0}{2}, \frac{b_0\sigma_H^2}{2} \right), \quad \text{equivalently } \frac{1}{\sigma_j^2} \sim \text{Gamma}\left(\frac{b_0}{2}, \frac{b_0\sigma_H^2}{2} \right).
+$$
+
+Mean conditional on variance: $$
+\mu_j \mid \sigma_j^2 \sim \mathcal{N}\left(\mu_H, \frac{\sigma_j^2}{a_0}\right).
+$$
+
+Joint prior density: $$
+p(\mu_j, \sigma_j^2) = p(\sigma_j^2)\, p(\mu_j \mid \sigma_j^2).
+$$
+
+**Posterior distributions:**
+
+Variance (equivalently, precision): $$
+\sigma_j^2 \mid \bar{y}_j, s_j^2 \sim \text{InvGamma}\left( \frac{b_{j,n}}{2}, \frac{b_{j,n}\sigma_{j,n}^2}{2} \right).
+$$
+
+Mean conditional on variance: $$
+\mu_j \mid \sigma_j^2, \bar{y}, s^2 \sim \mathcal{N} \left(\mu_{j,n}, \frac{\sigma^2}{a_{j,n}}\right).
+$$
+
+Joint posterior density: $$
+p(\mu_j, \sigma_j^2 \mid \bar{y}_j, s_j^2) = p(\sigma_j^2 \mid \bar{y}_j, s_j^2)\, p(\mu_j \mid \sigma_j^2, \bar{y}_j, s_j^2).
+$$
+
+**Posterior parameters:**
+
+$$
+a_{n,j} = a_{0}+n_j,
+$$ $$
+b_{n,j} = b_{0} + n_j,
+$$ $$
+\mu_{n,j} = \bar{y}_j \cdot \frac{n_j}{n_j + a_0} + \mu_H \cdot \frac{a_0}{n_j + a_0},
+$$ $$
+b_{n,j} \sigma_{n,j}^2 = (n_j - 1)s_j^2 + b_0 \sigma_H^2 + \frac{a_0 n_j}{a_0 + n_j} (\bar{y}_j - \mu_H)^2.
+$$
+
+**Parameter interpretation:**
+
+-   $\mu_j$ — mean of observations $Y_{j,i}$
+-   $\sigma_j^2$ — variance of observations $Y_{j,i}$
+-   $1/\sigma_j^2$ — precision of observations $Y_{j,i}$
+-   $\bar{y}_j$ — sample mean for species $j$
+-   $s_j^2$ — sample variance for species $j$
+-   $\mu_H$ — hyperprior mean of $\mu_j$
+-   $\mu_{n,j}$ — posterior mean of $\mu_j \mid \bar{y}_j, s_j^2$
+-   $1/\sigma_H^2 > 0$ — hyperprior mean of the precision $1/\sigma_j^2$
+-   $1/\sigma_{n,j}^2 > 0$ — posterior mean of the precision
+    $1/\sigma_j^2 \mid \bar{y}_j, s_j^2$
+-   $a_0 > 0$ — size of the fictitious prior sample for $\mu$
+-   $b_0 > 0$ — size of the fictitious prior sample for $\sigma^2$
+-   $\frac{n_j}{n_j + a_0}$ — weight assigned to the data
+-   $\frac{a_0}{n_j + a_0}$ — weight assigned to the prior
+
+**Hyperparameters**
+
+Since we cannot specify the hyperparameters $\mu_H$ and $\sigma_H$
+directly, we introduce a hierarchical structure and treat them as random
+variables with their own distributions.
+
+For $\mu_H$ we choose a Normal distribution with a very large variance,
+so as not to favour any particular value, while still not assigning
+equal probability to arbitrarily extreme values:
+
+$$
+\mu_H \sim \mathcal{N}(5,\; 10^6), \quad \mu_H > 0.
+$$
+
+For the scale hyperparameter $\sigma_H$ we follow the recommendation in
+[Gelman
+(2006)](https://sites.stat.columbia.edu/gelman/research/published/taumain.pdf){target="_blank"}
+and use a Half-Cauchy prior:
+
+$$
+\sigma_H \sim \text{Cauchy}(0, A), \quad \sigma_H > 0,
+$$
+
+where $A$ is a scale parameter controlling the variability of
+$\sigma_H$. Larger values of $A$ allow heavier tails and greater
+between-group heterogeneity.
+
+Because JAGS does not support the Cauchy distribution directly, we use
+the equivalence with a Student-$t$ distribution with one degree of
+freedom:
+
+$$
+\text{Student-}t(0,\, A^{-2},\, 1) \;=\; \text{Cauchy}(0, A).
+$$
+
+Returning to the key expression for $\mu_{n,j}$ — since we now treat
+$\mu_H$ and $\sigma_H$ as random rather than fixed, the posterior mean
+becomes
+
+$$
+\mu_{n,j} = \bar{y}_j \cdot \frac{n_j}{n_j + a_0} + \mathbb{E}(\mu_H) \cdot \frac{a_0}{n_j + a_0}.
+$$
+
+This is a **shrinkage estimator**: a weighted average of the group's own
+data mean and the global prior mean. The weights depend on sample size
+relative to $a_0$.
+
+-   Weight on data: $\dfrac{n_j}{n_j + a_0}$
+-   Weight on prior: $\dfrac{a_0}{n_j + a_0}$
+
+The more observations a group has, the more weight is placed on its own
+data; with few observations the prior dominates. We set $a_0 = 6$ to
+achieve a roughly balanced influence between data and prior, reflecting
+the fact that species can differ substantially and data quality is not
+always ideal.
+
+`Whitefish` and `Perch` represent the two extremes in our dataset.
+`Whitefish` has $n_7 = 6$ observations (the minimum), while `Perch` has
+$n_3 = 56$ (the maximum).
+
+For `Whitefish`: $$
+\frac{n_7}{n_7 + a_0} = \frac{6}{6 + 6} = 0.5, \qquad \frac{a_0}{n_7 + a_0} = \frac{6}{6 + 6} = 0.5.
+$$
+
+For `Perch`: $$
+\frac{n_3}{n_3 + a_0} = \frac{56}{56 + 6} \approx 0.9, \qquad \frac{a_0}{n_3 + a_0} = \frac{6}{56 + 6} \approx 0.1.
+$$
+
+Now we prepare the input data for JAGS (the output shows the chosen
+hyperparameter values):
+
+```{r}
+jags_data <- list(
+  y1 = data_jags$transf_y[data_jags$Species == "Bream"],
+  y2 = data_jags$transf_y[data_jags$Species == "Parkki"],
+  y3 = data_jags$transf_y[data_jags$Species == "Perch"],
+  y4 = data_jags$transf_y[data_jags$Species == "Pike"],
+  y5 = data_jags$transf_y[data_jags$Species == "Roach"],
+  y6 = data_jags$transf_y[data_jags$Species == "Smelt"],
+  y7 = data_jags$transf_y[data_jags$Species == "Whitefish"],
+  N1 = sum(data_jags$Species == "Bream"),
+  N2 = sum(data_jags$Species == "Parkki"),
+  N3 = sum(data_jags$Species == "Perch"),
+  N4 = sum(data_jags$Species == "Pike"),
+  N5 = sum(data_jags$Species == "Roach"),
+  N6 = sum(data_jags$Species == "Smelt"),
+  N7 = sum(data_jags$Species == "Whitefish"),
+  J  = 7,   # number of groups
+  A  = 1,   # Half-Cauchy scale; larger A -> heavier tails for sigma_H
+  a0 = 6,
+  b0 = 6
+)
+
+cat(" A =", jags_data$A,  "\n",
+    "a0 =", jags_data$a0, "\n",
+    "b0 =", jags_data$b0, "\n")
+```
+
+The JAGS model specification:
+
+```{r}
+jags_model <- "
+model {
+  # Likelihoods — one block per species
+  for (i in 1:N1) { y1[i] ~ dnorm(mu[1], tau[1]) }
+  for (i in 1:N2) { y2[i] ~ dnorm(mu[2], tau[2]) }
+  for (i in 1:N3) { y3[i] ~ dnorm(mu[3], tau[3]) }
+  for (i in 1:N4) { y4[i] ~ dnorm(mu[4], tau[4]) }
+  for (i in 1:N5) { y5[i] ~ dnorm(mu[5], tau[5]) }
+  for (i in 1:N6) { y6[i] ~ dnorm(mu[6], tau[6]) }
+  for (i in 1:N7) { y7[i] ~ dnorm(mu[7], tau[7]) }
+
+  # Group-level priors
+  for (j in 1:J) {
+    mu[j]  ~ dnorm(muH, a0 * tau[j]) T(0,)
+    tau[j] ~ dgamma(b0 / 2, (b0 / 2) * sigmaH^2) T(0,)
+  }
+
+  # Hyperpriors
+  muH    ~ dnorm(5, 0.000001) T(0,)
+  # Half-Cauchy via Student-t with 1 degree of freedom
+  sigmaH ~ dt(0, pow(A, -2), 1) T(0,)   # pow(A, -2) = 1/A^2
+}
+"
+cat(jags_model)
+```
+
+### Simulation
+
+With the model specified, we simulate the posterior distributions of the
+transformed variables $Y_j$.
+
+```{r}
+inits_list <- list(
+  list(.RNG.name = "base::Wichmann-Hill",  .RNG.seed = 1),
+  list(.RNG.name = "base::Marsaglia-Multicarry", .RNG.seed = 2),
+  list(.RNG.name = "base::Super-Duper",    .RNG.seed = 3)
+)
+result <- run.jags(
+  model    = jags_model,
+  data     = jags_data,
+  monitor  = c("mu", "tau", "muH", "sigmaH"),
+  inits    = inits_list,          
+  n.chains = 3,
+  burnin   = 1000,
+  sample   = 5000,
+  adapt    = 1000,
+  thin     = 1,
+  summarise = TRUE,
+  silent.jags = TRUE
+)
+
+MCMC <- result$mcmc |> as.matrix(iters = TRUE, chains = TRUE) |> as.data.frame()
+
+mu_cols  <- paste0("mu[",  1:7, "]")
+tau_cols <- paste0("tau[", 1:7, "]")
+mu_mat   <- MCMC[, mu_cols]
+tau_mat  <- MCMC[, tau_cols]
+sigma2_mat <- 1 / tau_mat
+
+# Back-transform to the original scale:
+# Y_j ~ N(mu_j, sigma_j^2), Y_j = log(X_j + c_shift)
+# => X_j = exp(Y_j) - c_shift = Z_j - c_shift, where Z_j ~ LogNormal(mu_j, sigma_j^2)
+# E[X_j] = exp(mu_j + sigma_j^2 / 2) - c_shift
+# Var[X_j] = (exp(sigma_j^2) - 1) * exp(2*mu_j + sigma_j^2)
+expectation <- exp(mu_mat  + sigma2_mat / 2) - c_shift
+variance    <- (exp(sigma2_mat) - 1) * exp(2 * mu_mat + sigma2_mat)
+precision   <- 1 / variance
+
+colnames(variance) <- paste0("var[", 1:ncol(variance), "]")
+
+MCMC_orig <- bind_cols(
+  as_tibble(expectation),
+  as_tibble(variance)
+)
+```
+
+Because we modelled the data on the transformed scale
+
+$$
+Y_j = \ln(X_j + 50); \quad Y_j \sim \mathcal{N}\!\left(\mu_{n,j},\, \sigma_{n,j}^{2}\right),
+$$
+
+interpreting results on the original weight scale requires a
+back-transformation. Starting from
+
+$$
+e^{Y_j} = X_j + 50 \implies X_j = e^{Y_j} - 50,
+$$
+
+we substitute $Z_j = e^{Y_j}$, so
+
+$$
+X_j = Z_j - 50, \quad \text{where } Z_j \sim \operatorname{LogNormal}\!\left(\mu_{n,j},\, \sigma_{n,j}^{2}\right).
+$$
+
+Using standard lognormal moment formulas:
+
+$$
+\mathbb{E}[X_j] = \mathbb{E}[Z_j] - 50 = e^{\mu_{n,j} + \sigma_{n,j}^2/2} - 50,
+$$
+
+$$
+\operatorname{Var}(X_j) = \operatorname{Var}(Z_j) = \left(e^{\sigma_{n,j}^2} - 1\right) \cdot e^{2\mu_{n,j} + \sigma_{n,j}^2}.
+$$
+
+For reference, the species–index mapping used throughout is:
+
+```{r}
+DT::datatable(
+  mapping_table,
+  rownames = FALSE,
+  extensions = 'Buttons',
+  options = list(
+    dom = 'Bt',
+    buttons = c('copy', 'csv', 'excel'),
+    pageLength = 7,
+    columnDefs = list(list(className = 'dt-center', targets = 0:1)),
+    order = list(list(0, 'asc'))
+  ),
+  caption = "Species-to-index mapping"
+) |>
+  formatStyle(columns = names(mapping_table), fontSize = '14px')
+```
+
+Summary statistics for posterior parameters on the original scale (after
+back-transformation). The table includes the MAP estimate, posterior
+mean, standard deviation, and 95% credible interval.
+
+```{r}
+summary_table_interactive <- MCMC_orig |>
+  pivot_longer(cols = everything(), names_to = "parameter", values_to = "value") |>
+  mutate(
+    parameter = case_when(
+      str_detect(parameter, "mu\\[\\d+\\]")  ~ str_replace(parameter, "mu\\[(\\d+)\\]",  "\u03bc<sub>\\1</sub>"),
+      str_detect(parameter, "var\\[\\d+\\]") ~ str_replace(parameter, "var\\[(\\d+)\\]", "\u03c3\u00b2<sub>\\1</sub>"),
+      TRUE ~ parameter
+    )
+  ) |>
+  group_by(parameter) |>
+  summarise(
+    `MAP`   = round(bayestestR::map_estimate(value)$MAP_Estimate, 1),
+    `Mean`  = round(mean(value), 1),
+    `SD`    = round(sd(value), 1),
+    `2.5%`  = round(quantile(value, 0.025), 1),
+    `97.5%` = round(quantile(value, 0.975), 1),
+    .groups = "drop"
+  )
+
+DT::datatable(
+  summary_table_interactive,
+  rownames = FALSE,
+  escape = FALSE,
+  options = list(
+    dom = 'Bt',
+    pageLength = 15
+  )
+)
+```
+
+The table shows substantial cross-species differences in both posterior
+means and variances. `Pike` (index 4) has both a high posterior mean
+weight and a large variance. `Roach` (index 5) sits at a lower level
+with less spread. `Whitefish` (index 7) shows an unusually high
+posterior standard deviation for its variance parameter, likely due to
+numerical instability compounded by the very small sample size (6
+observations) and a weight distribution that appears closer to Uniform
+than Normal. Notably, the MAP estimate for `Whitefish` falls outside its
+own 95% credible interval, suggesting convergence difficulties or a
+misspecified model structure for that group.
+
+## Posterior Mean Analysis
+
+We plot histograms of posterior group means on the original scale. A
+small number of extreme simulated values are excluded from the plot (at
+most a few dozen out of 15,000 per species) to avoid axis distortion;
+this does not affect interpretation materially.
+
+All histograms share a broadly similar shape, though they differ in
+location and spread, reflecting the true between-species weight
+differences.
+
+```{r}
+mu_data_exp <- expectation |>
+  select(starts_with("mu[")) |>
+  pivot_longer(cols = everything(), names_to = "parameter", values_to = "value") |>
+  mutate(index = as.integer(gsub("mu\\[|\\]", "", parameter))) |>
+  left_join(mapping_table, by = c("index" = "group"))
+
+mu_data_exp |>
+  filter(parameter %in% paste0("mu[", 1:7, "]")) |>
+  mutate(value = ifelse(Species == "Whitefish" & value > 1100, NA, value)) |>
+  mutate(value = ifelse(Species == "Smelt"     & value > 300,  NA, value)) |>
+  mutate(value = ifelse(Species == "Parkki"    & value > 500,  NA, value)) |>
+  mutate(value = ifelse(Species == "Pike"      & value > 1200, NA, value)) |>
+  mutate(value = ifelse(Species == "Roach"     & value > 350,  NA, value)) |>
+  mutate(value = ifelse(Species == "Perch"     & value > 700,  NA, value)) |>
+  mutate(value = ifelse(Species == "Bream"     & value > 800,  NA, value)) |>
+  ggplot(aes(x = value, fill = Species)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 30, alpha = 0.7, color = "white") +
+  scale_fill_manual(values = rainbow(7)) +
+  facet_wrap(~Species, scales = "free") +
+  labs(title = "Posterior distributions of group means (original scale)",
+       x = "Mean weight (g)",
+       y = "Probability density") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+The overlaid kernel density estimates below (x-axis capped at 1,200 g)
+confirm the species separation and show different degrees of posterior
+uncertainty. `Perch` and `Bream` have more symmetric and concentrated
+posteriors; `Whitefish` and `Pike` show heavier tails; `Smelt` and
+`Roach` have flatter, more spread-out densities.
+
+```{r}
+mu_data_exp |>
+  filter(parameter %in% paste0("mu[", 1:7, "]")) |>
+  ggplot(aes(x = value, color = Species, fill = Species)) +
+  geom_density(alpha = 0.4) +
+  scale_color_manual(values = rainbow(7)) +
+  scale_fill_manual(values = rainbow(7)) +
+  labs(title = "Kernel density estimates of posterior group means (original scale)",
+       x = "Mean weight (g)",
+       y = "Probability density") +
+  xlim(0, 1100) +
+  theme_minimal()
+```
+
+The following chart compares empirical sample means with posterior means
+(back-transformed from MCMC). The model **shrinks** the posterior means
+toward one another relative to the raw sample means — a direct
+consequence of partial pooling. We also observe a rank swap between
+`Roach` and `Parkki`: the two species switch their relative ordering
+when moving from sample to posterior means.
+
+```{r}
+# Posterior mean summary
+mu_summary <- expectation |>
+  select(starts_with("mu[")) |>
+  summarise(across(everything(), mean)) |>
+  pivot_longer(cols = everything(), names_to = "parameter", values_to = "mean") |>
+  mutate(index = as.integer(str_extract(parameter, "\\d+")))
+
+# Empirical means
+sample_means <- data |>
+  group_by(Species) |>
+  summarise(sample = mean(y), .groups = "drop") |>
+  mutate(index = row_number())
+
+plot_data <- left_join(sample_means, mu_summary, by = "index")
+
+plot_data_long <- plot_data |>
+  pivot_longer(cols = c(sample, mean), names_to = "type", values_to = "value") |>
+  mutate(type = factor(type, levels = c("sample", "mean")))
+
+ggplot(plot_data_long, aes(x = type, y = value, group = Species, color = Species)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  labs(title = "Empirical means vs. posterior means",
+       x = NULL, y = "Weight (g)") +
+  theme_minimal()
+```
+
+The same shrinkage pattern is visible when comparing empirical means
+with MAP estimates, and the `Roach`/`Parkki` rank swap persists.
+
+```{r}
+map_summary <- expectation |>
+  select(starts_with("mu[")) |>
+  summarise(across(everything(), ~ bayestestR::map_estimate(.x)$MAP)) |>
+  pivot_longer(cols = everything(), names_to = "parameter", values_to = "MAP") |>
+  mutate(index = as.integer(str_extract(parameter, "\\d+")))
+
+plot_data_map <- left_join(sample_means, map_summary, by = "index")
+
+plot_data_map_long <- plot_data_map |>
+  pivot_longer(cols = c(sample, MAP), names_to = "type", values_to = "value") |>
+  mutate(type = factor(type, levels = c("sample", "MAP")))
+
+ggplot(plot_data_map_long, aes(x = type, y = value, group = Species, color = Species)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  labs(title = "Empirical means vs. MAP estimates",
+       x = NULL, y = "Weight (g)") +
+  theme_minimal()
+```
+
+## Posterior Precision Analysis
+
+Histograms of posterior group precisions on the original scale. As with
+the means, the x-axis is trimmed to remove a small number of extreme
+values.
+
+The distributions display varying degrees of right-skewness. `Bream` is
+closest to symmetric; `Smelt` and `Whitefish` have the heaviest right
+tails. Absolute precision values are low (order $10^{-5}$ to $10^{-4}$),
+consistent with the large weight variances observed in the raw data.
+
+```{r}
+tau_data_exp <- precision |>
+  select(starts_with("tau[")) |>
+  pivot_longer(cols = everything(), names_to = "parameter", values_to = "value") |>
+  mutate(index = as.integer(gsub("tau\\[|\\]", "", parameter))) |>
+  left_join(mapping_table, by = c("index" = "group"))
+
+tau_data_exp |>
+  mutate(value = ifelse(Species == "Whitefish" & value > 5e-05, NA, value)) |>
+  mutate(value = ifelse(Species == "Smelt"     & value > 3e-04, NA, value)) |>
+  mutate(value = ifelse(Species == "Parkki"    & value > 2e-04, NA, value)) |>
+  mutate(value = ifelse(Species == "Roach"     & value > 2e-04, NA, value)) |>
+  mutate(value = ifelse(Species == "Pike"      & value > 15e-06, NA, value)) |>
+  filter(parameter %in% paste0("tau[", 1:7, "]")) |>
+  ggplot(aes(x = value, fill = Species)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 30, alpha = 0.7, color = "white") +
+  scale_fill_manual(values = rainbow(7)) +
+  facet_wrap(~Species, scales = "free") +
+  labs(title = "Posterior distributions of group precisions (original scale)",
+       x = "Precision",
+       y = "Probability density") +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_text(size = 6))
+```
+
+The overlaid kernel density estimates (x-axis capped at 0.00015) show
+that species differ not only in the location of their precision
+distributions but also in their spread — some groups have considerably
+more uncertainty in the precision estimate.
+
+```{r}
+tau_data_exp |>
+  filter(parameter %in% paste0("tau[", 1:7, "]")) |>
+  ggplot(aes(x = value, color = Species, fill = Species)) +
+  geom_density(alpha = 0.2) +
+  scale_color_manual(values = rainbow(7)) +
+  scale_fill_manual(values = rainbow(7)) +
+  labs(title = "Kernel density estimates of posterior group precisions (original scale)",
+       x = "Precision",
+       y = "Probability density") +
+  xlim(0, 0.00015) +
+  theme_minimal()
+```
+
+## Posterior Joint Distribution Analysis
+
+We plot contours of the joint posterior distributions
+$p(\mu_j, \tau_j \mid \mathbf{y})$ for each species.
+
+For `Bream` the contours resemble a bivariate Normal ellipse, indicating
+a relatively well-behaved joint posterior.
+
+For `Parkki`, `Perch`, and `Roach` the contours are elongated in the
+direction of the line $y \approx 1 - x$, indicating **negative posterior
+dependence** between the mean and precision: higher mean values
+correspond to lower precision estimates.
+
+`Pike` displays a similar pattern but with the contours oriented more
+vertically. `Whitefish` is the most extreme case — nearly vertical
+contours suggest that precision varies widely while the mean stays
+approximately fixed.
+
+The contours for `Smelt` are strongly curved (approximately hyperbolic),
+suggesting a complex mean–precision relationship or possible numerical
+instability.
+
+```{r}
+plot_joint <- function(mu_data, tau_data, label) {
+  comb <- bind_cols(
+    mu_data  |> select(value) |> rename(mu = value),
+    tau_data |> select(value) |> rename(tau = value)
+  )
+  ggplot(comb, aes(x = mu, y = tau)) +
+    geom_point(alpha = 0.3, size = 0.5) +
+    geom_density_2d_filled(alpha = 0.6, contour_var = "density", bins = 15) +
+    geom_density_2d(color = "black", linewidth = 0.5, bins = 15) +
+    scale_fill_manual(values = c("white", viridis::viridis(14, option = "C"))) +
+    labs(x = "Mean", y = "Precision",
+         title = paste0("Joint posterior contours — ", label)) +
+    theme_minimal()
+}
+
+plot_joint(mu_data_exp |> filter(index == 1), tau_data_exp |> filter(index == 1), "Bream")
+```
+
+```{r}
+plot_joint(mu_data_exp |> filter(index == 2), tau_data_exp |> filter(index == 2), "Parkki")
+```
+
+```{r}
+plot_joint(mu_data_exp |> filter(index == 3), tau_data_exp |> filter(index == 3), "Perch")
+```
+
+```{r}
+plot_joint(mu_data_exp |> filter(index == 4), tau_data_exp |> filter(index == 4), "Pike")
+```
+
+```{r}
+plot_joint(mu_data_exp |> filter(index == 5), tau_data_exp |> filter(index == 5), "Roach")
+```
+
+```{r}
+plot_joint(mu_data_exp |> filter(index == 6), tau_data_exp |> filter(index == 6), "Smelt")
+```
+
+Although the `Smelt` contour plot may suggest that $\tau_6$ reached
+zero, a direct check confirms this did not occur — all 15,000 posterior
+samples have $\tau_6 > 0$.
+
+```{r}
+data6tau <- tau_data_exp |> filter(index == 6) |> select(value) |> rename(tau = value)
+sum(data6tau == 0)
+```
+
+```{r}
+plot_joint(mu_data_exp |> filter(index == 7), tau_data_exp |> filter(index == 7), "Whitefish")
+```
+
+## Prior Distribution Analysis
+
+We simulate the prior distributions of $Y_j$ by running JAGS with no
+observed data and no likelihood — sampling from the prior alone.
+
+```{r}
+jags_data_prior <- list(
+  J  = 7,
+  A  = 1,
+  a0 = 6,
+  b0 = 6
+)
+cat(" A =", jags_data_prior$A,  "\n",
+    "a0 =", jags_data_prior$a0, "\n",
+    "b0 =", jags_data_prior$b0, "\n")
+```
+
+```{r}
+jags_model_prior <- "
+model {
+  # Group-level priors only (no likelihood)
+  for (j in 1:J) {
+    mu[j]  ~ dnorm(muH, a0 * tau[j]) T(0,)
+    tau[j] ~ dgamma(b0 / 2, (b0 / 2) * sigmaH^2) T(0,)
+  }
+
+  # Hyperpriors
+  muH    ~ dnorm(5, 0.000001) T(0,)
+  sigmaH ~ dt(0, pow(A, -2), 1) T(0,)
+}
+"
+cat(jags_model_prior)
+```
+
+```{r}
+result_prior <- run.jags(
+  model    = jags_model_prior,
+  data     = jags_data_prior,
+  monitor  = c("mu", "tau", "muH", "sigmaH"),
+  inits    = inits_list,        
+  n.chains = 3,
+  burnin   = 1000,
+  sample   = 5000,
+  adapt    = 1000,
+  thin     = 1,
+  summarise = TRUE,
+  silent.jags = TRUE
+)
+
+MCMC_prior <- result_prior$mcmc |> as.matrix(iters = TRUE, chains = TRUE) |> as.data.frame()
+
+mu_cols.prior  <- paste0("mu[",  1:7, "]")
+tau_cols.prior <- paste0("tau[", 1:7, "]")
+mu_mat.prior   <- MCMC_prior[, mu_cols.prior]
+tau_mat.prior  <- MCMC_prior[, tau_cols.prior]
+sigma2_mat.prior <- 1 / tau_mat.prior
+```
+
+> **Note on back-transformation of priors:** We do not back-transform
+> prior samples to the original scale. The priors are intentionally
+> weakly informative on the transformed scale; back-transforming would
+> produce extreme values (up to infinity in some samples), which is an
+> artefact of the transformation rather than a meaningful prior
+> statement. All prior analysis therefore remains on the transformed
+> scale.
+
+Histograms of prior group means confirm that the distributions are
+indeed weakly informative and broadly similar across species, as
+intended.
+
+```{r}
+mu_data_prior <- mu_mat.prior |>
+  pivot_longer(cols = everything(), names_to = "parameter", values_to = "value") |>
+  filter(parameter %in% paste0("mu[", 1:7, "]")) |>
+  mutate(index = as.integer(gsub("mu\\[|\\]", "", parameter))) |>
+  left_join(mapping_table, by = c("index" = "group"))
+
+mu_data_prior |>
+  ggplot(aes(x = value, fill = Species)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 30, color = "white") +
+  scale_fill_hue(c = 60, l = 70) +
+  facet_wrap(~Species, scales = "free") +
+  xlim(0, 3500) +
+  labs(title = "Prior distributions of group means (transformed scale)",
+       x = "Mean of transformed weight",
+       y = "Density") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+Prior group precisions show a heavy right tail. Without axis truncation,
+values up to $10^7$ appear — a consequence of the Gamma prior on
+precision combined with the Half-Cauchy on $\sigma_H$. Most prior mass
+is concentrated near zero, but the distribution is deliberately
+fat-tailed to allow for potentially extreme precision values.
+
+```{r}
+tau_data_prior <- tau_mat.prior |>
+  pivot_longer(cols = everything(), names_to = "parameter", values_to = "value") |>
+  filter(parameter %in% paste0("tau[", 1:7, "]")) |>
+  mutate(index = as.integer(gsub("tau\\[|\\]", "", parameter))) |>
+  left_join(mapping_table, by = c("index" = "group"))
+
+tau_data_prior |>
+  ggplot(aes(x = value, fill = Species)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 bins = 30, color = "white") +
+  scale_fill_hue(c = 60, l = 70) +
+  facet_wrap(~Species, scales = "free") +
+  xlim(0, 10) +
+  labs(title = "Prior distributions of group precisions (transformed scale)",
+       x = "Precision (transformed scale)",
+       y = "Density") +
+  theme_minimal() +
+  theme(legend.position = "none", axis.text.x = element_text(size = 6))
+```
+
+## Hyperparameter Analysis
+
+Finally, we examine the marginal hyperparameter distributions by running
+JAGS with no data and no likelihood or group-level priors — sampling
+from the hyperpriors alone.
+
+```{r}
+jags_data_hyper <- list(A = 1)
+
+jags_model_hyper <- "
+model {
+  muH    ~ dnorm(5, 0.000001) T(0,)
+  sigmaH ~ dt(0, pow(A, -2), 1) T(0,)
+}
+"
+```
+
+```{r}
+result_hyper <- run.jags(
+  model    = jags_model_hyper,
+  data     = jags_data_hyper,
+  monitor  = c("muH", "sigmaH"),
+  n.chains = 3,
+  inits    = inits_list,         
+  burnin   = 1000,
+  sample   = 5000,
+  adapt    = 1000,
+  thin     = 1,
+  summarise = TRUE,
+  silent.jags = TRUE
+)
+
+MCMC_hyper <- result_hyper$mcmc |> as.matrix(iters = TRUE, chains = TRUE) |> as.data.frame()
+
+mu_H    <- MCMC_hyper$muH
+sigma_H <- MCMC_hyper$sigmaH
+```
+
+The histogram for $\mu_H$ confirms a very weakly informative, diffuse
+distribution — consistent with our intent.
+
+```{r}
+ggplot(data.frame(mu_H = mu_H), aes(x = mu_H)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 fill = "skyblue", color = "white", boundary = 0) +
+  ggtitle(expression("Prior distribution of hyperparameter " * mu[H])) +
+  labs(x = expression(mu[H]), y = "Probability density") +
+  theme_minimal() +
+  theme(text = element_text(size = 14))
+```
+
+The distribution of $\sigma_H$ has a pronounced right tail — typical of
+the Half-Cauchy. Before axis truncation, values reach up to 200,000. We
+choose the Half-Cauchy precisely because it is weakly informative yet
+flexible: it concentrates most probability near zero (small
+between-group heterogeneity) while still allowing extremely large values
+(high heterogeneity), without hard-coding an upper bound. This is
+advantageous when groups may vary dramatically — as they do here — but
+we do not want to constrain that variation a priori.
+
+```{r}
+ggplot(data.frame(sigma_H = sigma_H), aes(x = sigma_H)) +
+  geom_histogram(aes(y = after_stat(density)),
+                 fill = "skyblue", color = "white") +
+  ggtitle(expression("Prior distribution of hyperparameter " * sigma[H])) +
+  labs(x = expression(sigma[H]), y = "Probability density") +
+  xlim(0, 25) +
+  theme_minimal() +
+  theme(text = element_text(size = 14))
+```
+
+## Conclusion
+
+We fitted a Bayesian hierarchical Normal model to log-transformed fish
+weight data from the Fish Market dataset. Key findings and observations:
+
+**Shrinkage.** The model pulls posterior group means toward the global
+mean relative to the raw sample means. This effect is strongest for
+species with few observations (`Whitefish`, $n = 6$) and weakest for the
+most observed species (`Perch`, $n = 56$). The rank of `Roach` and
+`Parkki` even swaps between the empirical and posterior estimates — an
+example of how pooling can overturn naive comparisons when sample sizes
+differ.
+
+**Heterogeneity.** Despite the partial pooling, the seven species remain
+clearly separated in their posterior mean distributions, confirming that
+the dataset contains genuine between-species weight differences that the
+hierarchical structure respects.
+
+**Numerical stability.** The shifted log transformation
+$Y = \ln(X + 50)$ was necessary to achieve MCMC convergence. The shift
+constant $c = 50$ represents a deliberate compromise between stability
+and minimal distortion of statistical inferences.
+
+**Model limitations.** The normality assumption is violated for `Perch`
+(bimodal distribution, likely a mixture of two sub-populations) and
+`Smelt` (heavy-tailed outliers). Future extensions could replace the
+Normal likelihood with a Student-$t$ likelihood for robustness, or fit a
+finite mixture model for `Perch`. The `Whitefish` group — with only 6
+observations — shows signs of convergence difficulties and warrants a
+more informative prior or collection of additional data.
+
+**Relevance to applied modelling.** The core technique — partial pooling
+of group-level parameters within a hierarchical Bayesian framework — is
+directly applicable to grouped loss modelling in insurance and
+catastrophe modelling: for example, modelling claim frequencies or
+severities pooled across geographic zones, peril types, or lines of
+business, where data sparsity varies widely by group.
