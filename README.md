@@ -1,6 +1,11 @@
 # Bayesian Hierarchical Modelling of Fish Weights
 
-A Quarto report implementing a Bayesian hierarchical Normal model on the [Fish Market dataset](https://www.kaggle.com/datasets/vipullrathod/fish-market) (Kaggle). The project was originally developed as a university assignment and is included here as a portfolio piece demonstrating applied Bayesian modelling.
+A Quarto report implementing a Bayesian hierarchical Normal model on the 
+[Fish Market dataset](https://www.kaggle.com/datasets/vipullrathod/fish-market) 
+(Kaggle). The project was originally developed as a coursework implementation of 
+a Bayesian hierarchical model and is included here as a portfolio piece 
+demonstrating applied Bayesian inference in a multi-group setting.
+
 
 ## Live report
 
